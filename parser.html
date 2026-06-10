@@ -61,11 +61,16 @@
   }
   #tree-wrap ul { list-style: none; margin: 0; padding-left: 1.1rem;
                   border-left: 1px dotted #d0d7de; }
-  #tree-wrap > ul { padding-left: 0; border-left: 0; }
+  #tree-wrap > ul, ul#tree { padding-left: 0; border-left: 0; }
   #tree-wrap li { margin: 1px 0; }
   #tree-wrap li[data-node] > .nodeline { cursor: pointer; }
   .nodeline { border-radius: 3px; padding: 0 2px; }
   li.selected > .nodeline { background: #fff8c5; box-shadow: 0 0 0 1px #d4a72c; }
+  .tw {
+    display: inline-block; width: .85rem; color: #8c959f;
+    cursor: pointer; user-select: none;
+  }
+  li.more > .nodeline { color: #0969da; cursor: pointer; font-style: italic; }
   .nodekind { font-weight: 600; }
   /* interior labels carry their box's depth color */
   .nodekind.d0 { color: #d64545; } .nodekind.d1 { color: #d88a1e; }
@@ -193,80 +198,108 @@ try {
   throw e;
 }
 
-// preorder index of all nodes: assigns ids (mirrored as data-node in the
-// tree pane), depths, and trimmed extents for editor selections
-function indexNodes(roots) {
-  const list = [];
-  function rec(node, depth) {
-    const name = kindName(node.head & 0xffff);
-    const err = isErrName(name);
-    const trivia = node.leaf && isExtentSkipName(name) && !err;
-    const entry = { a: node.a, b: node.b, lo: node.a, hi: node.b,
-                    depth, err, trivia, leaf: !!node.leaf };
-    node._id = list.length;
-    node._depth = depth;
-    list.push(entry);
-    if (node.leaf) return trivia ? null : [node.a, node.b];
-    let lo = 0, hi = 0;
-    for (const c of node.children) {
-      const r = rec(c, depth + 1);
-      if (r !== null) {
-        if (lo === 0) lo = r[0];
-        hi = r[1];
-      }
-    }
-    if (lo !== 0) {
-      entry.lo = lo;
-      entry.hi = hi;
-    }
-    return [entry.lo, entry.hi];
-  }
-  for (const r of roots) rec(r, 0);
-  return list;
-}
-
-function renderNode(node, bytes, dec) {
-  const kind = node.head & 0xffff;
-  const name = kindName(kind);
-  const isErr = isErrName(name);
-  const isTrivia = name === "Whitespace" || name === "NewlineWs" || name === "Comment";
-  const range = `<span class="range">[${node.a}:${node.b}]</span>`;
-  if (node.leaf) {
-    const piece = dec.decode(bytes.subarray(node.a - 1, node.b));
-    const shown = piece.length > 24 ? piece.slice(0, 24) + "…" : piece;
-    const kcls = isErr ? "nodekind err" : "leafkind";
-    return `<li class="${isTrivia ? "trivia" : ""}" data-node="${node._id}">` +
-           `<span class="nodeline"><span class="${kcls}">${esc(name)}</span> ` +
-           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}</span></li>`;
-  }
-  const inner = node.children.map((c) => renderNode(c, bytes, dec)).join("");
-  const kcls = isErr ? "nodekind err" : `nodekind d${node._depth % 6}`;
-  return `<li data-node="${node._id}"><span class="nodeline">` +
-         `<span class="${kcls}">[${esc(name)}]</span> ${range}</span>` +
-         `<ul>${inner}</ul></li>`;
-}
-
 // highlight mode: default to the parse-tree boxes, remember the choice
 let mode = localStorage.getItem("parser-demo-hlmode");
 if (mode !== "tokens" && mode !== "tree") mode = "tree";
 document.querySelector(`input[name="hlmode"][value="${mode}"]`).checked = true;
 let cached = null;   // { ev, text, bytes, b2c, roots, index }
 
-// --- token mode: monaco inline decorations -----------------------------------
+// first index with get(arr[i]) >= key (arrays sorted by get)
+const lowerBound = (arr, key, get) => {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    get(arr[m]) < key ? (lo = m + 1) : (hi = m);
+  }
+  return lo;
+};
+
+// --- node index ----------------------------------------------------------------
+// preorder index of all nodes: ids (mirrored as data-node in the outline),
+// depths, parents, trimmed extents, and box heights — everything that is
+// viewport-independent gets computed once per parse here
+function indexNodes(roots) {
+  const list = [];
+  function rec(node, depth, parentId, childIdx) {
+    const name = kindName(node.head & 0xffff);
+    const err = isErrName(name);
+    const trivia = !!node.leaf && isExtentSkipName(name) && !err;
+    const id = list.length;
+    const entry = { node, name, a: node.a, b: node.b, lo: node.a, hi: node.b,
+                    depth, err, trivia, leaf: !!node.leaf, parent: parentId,
+                    childIdx, boxh: 0, hasExtent: node.leaf ? !trivia : false };
+    node._id = id;
+    node._depth = depth;
+    list.push(entry);
+    if (node.leaf) return entry;
+    let lo = 0, hi = 0, h = 0;
+    for (let k = 0; k < node.children.length; k++) {
+      const ce = rec(node.children[k], depth + 1, id, k);
+      h = Math.max(h, ce.boxh + 1);
+      if (ce.hasExtent) {
+        if (lo === 0) lo = ce.lo;
+        hi = ce.hi;
+        entry.hasExtent = true;
+      }
+    }
+    entry.boxh = h;
+    if (entry.hasExtent) {
+      entry.lo = lo;
+      entry.hi = hi;
+    }
+    return entry;
+  }
+  roots.forEach((r) => rec(r, 0, null, 0));
+  return list;
+}
+
+// --- byte/char/viewport helpers --------------------------------------------------
+// 0-based byte offset of a 0-based char offset (inverse of byteToCharMap)
+function charToByte(off) {
+  const { b2c } = cached;
+  let lo = 0, hi = b2c.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    b2c[mid] < off ? (lo = mid + 1) : (hi = mid);
+  }
+  return lo;
+}
+
+// visible line/byte window (with a buffer so small scrolls stay covered
+// between refreshes); ALL highlight rendering is limited to this window so
+// the page scales with the viewport, not the file
+const VIEW_BUFFER_LINES = 30;
+function viewWindow() {
+  const vr = editor.getVisibleRanges();
+  if (!vr.length) return null;
+  const sl = Math.max(1, vr[0].startLineNumber - VIEW_BUFFER_LINES);
+  const el = Math.min(model.getLineCount(),
+                      vr[vr.length - 1].endLineNumber + VIEW_BUFFER_LINES);
+  const cs = model.getOffsetAt({ lineNumber: sl, column: 1 });
+  const ce = model.getOffsetAt({ lineNumber: el, column: model.getLineMaxColumn(el) });
+  return { sl, el, vs: charToByte(cs) + 1, ve: charToByte(ce) + 1 };
+}
+
+// --- token mode: monaco inline decorations (viewport window only) --------------
 function tokenDecorations() {
   const { ev, b2c } = cached;
+  const w = viewWindow();
+  if (!w) return [];
+  const toks = ev.tokens;
   const out = [];
-  let ci = 0;
-  for (let i = 2; i <= ev.tokens.length; i++) {
-    const [head, , nextByte] = ev.tokens[i - 1];
+  // first token (julia index i >= 2) whose end byte reaches the window
+  let i = 2 + lowerBound(toks.slice(1), w.vs + 1, (t) => t[2]);
+  for (; i <= toks.length; i++) {
+    const [head, , nextByte] = toks[i - 1];
+    const a = toks[i - 2][2], b = nextByte - 1;
+    if (a > w.ve) break;
     const kind = head & 0xffff;
     const name = kindName(kind);
-    const a = ev.tokens[i - 2][2], b = nextByte - 1;
     if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
     const isWs = name === "Whitespace" || name === "NewlineWs";
     let cls = "";
     if (isErrName(name)) cls = "tok-error";
-    else if (!isWs) cls = "c" + (ci++ % 6);
+    else if (!isWs) cls = "c" + (i % 6);   // index-stable across scrolling
     if (!cls) continue;
     const s = model.getPositionAt(b2c[a - 1]);
     const e = model.getPositionAt(b2c[b]);
@@ -278,7 +311,7 @@ function tokenDecorations() {
   return out;
 }
 
-// --- tree mode: 2D boxes in monaco's scrolled content -------------------------
+// --- tree mode: 2D boxes in monaco's scrolled content (viewport window) --------
 function boxLayer() {
   const host = editor.getDomNode().querySelector(".lines-content");
   let layer = host.querySelector("#treeboxes");
@@ -290,115 +323,107 @@ function boxLayer() {
   return layer;
 }
 
-// content-space rect of a byte range (1-based inclusive); multi-line ranges
-// union their per-line extents (tokens only — boxes union these further).
-// Vertically inset from the full line box toward the glyph ink, so boxes on
-// consecutive lines don't touch (outsets re-expand them by nesting depth).
-function measureRange(a, b) {
-  const { b2c } = cached;
-  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
-  const fontSize = editor.getOption(monaco.editor.EditorOption.fontSize);
-  const vinset = Math.max(Math.floor((lineH - fontSize) / 2) - 1, 0);
-  const s = model.getPositionAt(b2c[a - 1]);
-  const e = model.getPositionAt(Math.max(b2c[b], b2c[a - 1]));
-  let left = Infinity, right = -Infinity;
-  for (let ln = s.lineNumber; ln <= e.lineNumber; ln++) {
-    const c1 = ln === s.lineNumber ? s.column : 1;
-    const c2 = ln === e.lineNumber ? e.column : model.getLineMaxColumn(ln);
-    left = Math.min(left, editor.getOffsetForColumn(ln, c1));
-    right = Math.max(right, editor.getOffsetForColumn(ln, c2));
-  }
-  return { left, right,
-           top: editor.getTopForLineNumber(s.lineNumber) + vinset,
-           bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
-}
-
 let drawnBoxes = null;   // visible box rects in paint order, for click hit-tests
 
 function renderBoxes() {
-  const { text, b2c, roots } = cached;
+  const { text, b2c, roots, index } = cached;
+  const w = viewWindow();
   const layer = boxLayer();
   layer.replaceChildren();
   drawnBoxes = [];
+  if (!w) return;
+  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
+  const fontSize = editor.getOption(monaco.editor.EditorOption.fontSize);
+  const vinset = Math.max(Math.floor((lineH - fontSize) / 2) - 1, 0);
+
+  // horizontal extent measured over the window's lines only; vertical extent
+  // exact (so partially visible boxes keep their true top/bottom offscreen)
+  function measure(a, b) {
+    const s = model.getPositionAt(b2c[a - 1]);
+    const e = model.getPositionAt(Math.max(b2c[b], b2c[a - 1]));
+    let left = Infinity, right = -Infinity;
+    const l0 = Math.max(s.lineNumber, w.sl), l1 = Math.min(e.lineNumber, w.el);
+    for (let ln = l0; ln <= l1; ln++) {
+      const c1 = ln === s.lineNumber ? s.column : 1;
+      const c2 = ln === e.lineNumber ? e.column : model.getLineMaxColumn(ln);
+      left = Math.min(left, editor.getOffsetForColumn(ln, c1));
+      right = Math.max(right, editor.getOffsetForColumn(ln, c2));
+    }
+    if (right < left) { left = 0; right = 0; }
+    return { left, right,
+             top: editor.getTopForLineNumber(s.lineNumber) + vinset,
+             bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
+  }
+  function verticalExtent(lo, hi) {
+    const s = model.getPositionAt(b2c[lo - 1]);
+    const e = model.getPositionAt(Math.max(b2c[hi], b2c[lo - 1]));
+    return { top: editor.getTopForLineNumber(s.lineNumber) + vinset,
+             bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
+  }
   const union = (u, v) =>
     v === null ? u : u === null ? { ...v } : {
       left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
       right: Math.max(u.right, v.right), bottom: Math.max(u.bottom, v.bottom),
     };
-  const entries = [];
-  function rec(node, depth) {       // -> {h, u, lo, hi}
-    const name = kindName(node.head & 0xffff);
-    const err = isErrName(name);
+
+  const out = [];
+  function walk(node) {
+    if (node.b < w.vs || node.a > w.ve) return null;
+    const e = index[node._id];
     if (node.leaf) {
-      if (isExtentSkipName(name) && !err) return { h: 0, u: null, lo: 0, hi: 0 };
-      const u = measureRange(node.a, node.b);
-      if (err) {
-        entries.push({ u: { ...u }, depth, height: 0, err, name,
-                       lo: node.a, hi: node.b, id: node._id });
-      } else if (!isDelimName(name) && name !== "Comment") {
-        entries.push({ u: { ...u }, depth, height: 0, err: false, leaf: true,
-                       name, lo: node.a, hi: node.b, id: node._id });
-      }
-      return { h: 0, u, lo: node.a, hi: node.b };
+      if (e.trivia) return null;
+      const u = measure(node.a, node.b);
+      if (e.err || (!isDelimName(e.name) && e.name !== "Comment"))
+        out.push({ u: { ...u }, e });
+      return u;
     }
-    const entry = { u: null, depth, height: 0, err, name: `[${name}]`,
-                    lo: node.a, hi: node.b, id: node._id };
-    entries.push(entry);
-    let h = 0;
+    const slot = { u: null, e };
+    out.push(slot);
     let u = null;
-    let lo = 0, hi = 0;
-    for (const c of node.children) {
-      const r = rec(c, depth + 1);
-      h = Math.max(h, r.h + 1);
-      if (r.u !== null) {
-        u = union(u, r.u);
-        if (lo === 0) lo = r.lo;
-        hi = r.hi;
-      }
+    const kids = node.children;
+    let k = lowerBound(kids, w.vs, (c) => c.b);
+    for (; k < kids.length && kids[k].a <= w.ve; k++) {
+      u = union(u, walk(kids[k]));
     }
-    entry.height = h;
-    if (u === null) {
-      // all-trivia node (e.g. an empty block): fall back to its full range
-      u = node.b >= node.a ? measureRange(node.a, node.b) : null;
-      lo = node.a;
-      hi = node.b;
+    if (u !== null && e.hasExtent) {
+      const v = verticalExtent(e.lo, e.hi);   // true extent even offscreen
+      slot.u = { left: u.left, right: u.right, top: v.top, bottom: v.bottom };
+    } else {
+      slot.u = u;
     }
-    entry.u = u;
-    entry.lo = lo;
-    entry.hi = hi;
-    return { h, u, lo, hi };
+    return slot.u;
   }
-  for (const r of roots) rec(r, 0);
-  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
+  for (const r of roots) walk(r);
+
   const spacey = (c) =>
     c === undefined || c === " " || c === "\n" || c === "\t";
-  for (const e of entries) {
-    if (e.u === null) continue;
-    const pad = Math.min(e.height, 3) + 1;
+  for (const { u, e } of out) {
+    if (u === null) continue;
+    const pad = Math.min(e.boxh, 3) + 1;
     // horizontal outset only into whitespace: a single-line box knows
     // exactly which characters flank it — when the neighbor is a glyph
     // (e.g. the $ before an interpolation's parens, or adjacent tokens in
     // z^2), the edge stays flush so neighboring boxes share one seam
-    const oneLine = e.u.bottom - e.u.top < 1.5 * lineH;
+    const oneLine = u.bottom - u.top < 1.5 * lineH;
     let padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
     const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 0;
     // content space is clipped at x=0 (the line-number margin starts there):
     // column-1 boxes can only outset into what's actually available
-    padL = Math.min(padL, Math.max(e.u.left, 0));
+    padL = Math.min(padL, Math.max(u.left, 0));
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
-    d.title = e.name;
-    const left = e.u.left - padL;
-    const top = e.u.top - pad;
-    const width = Math.max(e.u.right - e.u.left, 3) + padL + padR;
-    const height = e.u.bottom - e.u.top + 2 * pad;
+    d.title = e.leaf ? e.name : `[${e.name}]`;
+    const left = u.left - padL;
+    const top = u.top - pad;
+    const width = Math.max(u.right - u.left, 3) + padL + padR;
+    const height = u.bottom - u.top + 2 * pad;
     d.style.left = left + "px";
     d.style.top = top + "px";
     d.style.width = width + "px";
     d.style.height = height + "px";
     layer.appendChild(d);
     drawnBoxes.push({ left, top, right: left + width, bottom: top + height,
-                      id: e.id });
+                      id: e.node._id });
   }
 }
 
@@ -406,10 +431,161 @@ function applyHighlight() {
   if (!cached) return;
   if (mode === "tokens") {
     boxLayer().replaceChildren();
+    drawnBoxes = null;
     decorations.set(tokenDecorations());
   } else {
     decorations.set([]);
     renderBoxes();
+  }
+}
+
+let hlRaf = 0;
+function scheduleHighlight() {
+  if (hlRaf) return;
+  hlRaf = requestAnimationFrame(() => {
+    hlRaf = 0;
+    applyHighlight();
+  });
+}
+
+// --- virtualized tree outline ----------------------------------------------------
+// only expanded nodes are in the DOM; children render in windows of CHUNK
+// with "show more" stubs, so the outline scales with what's open, not with
+// the file (data.jl-sized inputs produce ~650k nodes)
+const CHUNK = 300;
+const EXPAND_BUDGET = 1500;
+let expanded = new Set();                 // node ids with children attached
+let ulState = new Map();                  // id -> {start, end} child window
+
+const liFor = (id) => treeEl.querySelector(`li[data-node="${id}"]`);
+
+function lineHTML(node, e) {
+  const arrow = !node.leaf && node.children.length
+    ? `<span class="tw">${expanded.has(node._id) ? "▾" : "▸"}</span>`
+    : `<span class="tw"></span>`;
+  const range = `<span class="range">[${node.a}:${node.b}]</span>`;
+  if (node.leaf) {
+    const piece = new TextDecoder().decode(
+      cached.bytes.subarray(node.a - 1, node.b));
+    const shown = piece.length > 24 ? piece.slice(0, 24) + "…" : piece;
+    const kcls = e.err ? "nodekind err" : "leafkind";
+    const isTrivia = e.trivia || e.name === "Comment";
+    return `${arrow}<span class="${kcls}">${esc(e.name)}</span> ` +
+           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}`;
+  }
+  const kcls = e.err ? "nodekind err" : `nodekind d${e.depth % 6}`;
+  const count = `<span class="range">· ${node.children.length}</span>`;
+  return `${arrow}<span class="${kcls}">[${esc(e.name)}]</span> ${range} ${count}`;
+}
+
+function makeLi(node) {
+  const e = cached.index[node._id];
+  const li = document.createElement("li");
+  li.dataset.node = node._id;
+  if (e.trivia || (e.leaf && e.name === "Comment")) li.classList.add("trivia");
+  const line = document.createElement("span");
+  line.className = "nodeline";
+  line.innerHTML = lineHTML(node, e);
+  li.appendChild(line);
+  if (!node.leaf && expanded.has(node._id)) attachUL(li, node);
+  return li;
+}
+
+function fillUL(ul, node, st) {
+  ul.replaceChildren();
+  if (st.start > 0) ul.appendChild(moreLi(node, -1));
+  for (let k = st.start; k < st.end; k++) ul.appendChild(makeLi(node.children[k]));
+  if (st.end < node.children.length) ul.appendChild(moreLi(node, +1));
+}
+
+function moreLi(node, dir) {
+  const st = ulState.get(node._id);
+  const n = dir < 0 ? st.start : node.children.length - st.end;
+  const li = document.createElement("li");
+  li.className = "more";
+  li.innerHTML = `<span class="nodeline">… ${n} ${dir < 0 ? "earlier" : "more"}</span>`;
+  li.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (dir < 0) st.start = Math.max(0, st.start - CHUNK);
+    else st.end = Math.min(node.children.length, st.end + CHUNK);
+    fillUL(li.parentElement, node, st);
+  });
+  return li;
+}
+
+function attachUL(li, node) {
+  let st = ulState.get(node._id);
+  if (!st) {
+    st = { start: 0, end: Math.min(node.children.length, CHUNK) };
+    ulState.set(node._id, st);
+  }
+  const ul = document.createElement("ul");
+  fillUL(ul, node, st);
+  li.appendChild(ul);
+}
+
+function setArrow(li, open) {
+  const tw = li.querySelector(":scope > .nodeline > .tw");
+  if (tw) tw.textContent = open ? "▾" : "▸";
+}
+
+function windowAround(idx, total) {
+  let start = Math.max(0, idx - (CHUNK >> 1));
+  start = Math.min(start, Math.max(0, total - CHUNK));
+  return { start, end: Math.min(total, start + CHUNK) };
+}
+
+function expandNode(node, centerIdx = null) {
+  const id = node._id;
+  const total = node.children.length;
+  if (!expanded.has(id)) {
+    expanded.add(id);
+    ulState.set(id, windowAround(centerIdx ?? 0, total));
+    const li = liFor(id);
+    if (li) {
+      setArrow(li, true);
+      attachUL(li, node);
+    }
+  } else if (centerIdx !== null) {
+    const st = ulState.get(id);
+    if (centerIdx < st.start || centerIdx >= st.end) {
+      Object.assign(st, windowAround(centerIdx, total));
+      const li = liFor(id);
+      const ul = li?.querySelector(":scope > ul");
+      if (ul) fillUL(ul, node, st);
+    }
+  }
+}
+
+function collapseNode(node) {
+  expanded.delete(node._id);
+  const li = liFor(node._id);
+  if (li) {
+    setArrow(li, false);
+    li.querySelector(":scope > ul")?.remove();
+  }
+}
+
+function renderTree() {
+  expanded = new Set();
+  ulState = new Map();
+  treeEl.replaceChildren();
+  const { roots } = cached;
+  for (const r of roots) treeEl.appendChild(makeLi(r));
+  // auto-expand breadth-first while the rendered count stays comfortable
+  let budget = EXPAND_BUDGET - roots.length;
+  const queue = roots.filter((n) => !n.leaf && n.children.length);
+  while (queue.length && budget > 0) {
+    const n = queue.shift();
+    const win = Math.min(n.children.length, CHUNK);
+    if (win > budget) continue;
+    expandNode(n);
+    budget -= win;
+    const st = ulState.get(n._id);
+    for (let k = st.start; k < st.end; k++) {
+      const c = n.children[k];
+      if (!c.leaf && c.children.length) queue.push(c);
+    }
   }
 }
 
@@ -430,32 +606,42 @@ function scrollTreePane(li) {
   }
 }
 
+function revealNode(id) {
+  const chain = [];
+  for (let e = cached.index[id]; ; e = cached.index[e.parent]) {
+    chain.unshift(e);
+    if (e.parent === null) break;
+  }
+  for (let i = 0; i + 1 < chain.length; i++) {
+    expandNode(chain[i].node, chain[i + 1].childIdx);
+  }
+}
+
 function selectTreeNode(id, { scrollTree }) {
   selectedLi?.classList.remove("selected");
-  selectedLi = id === null ? null : treeEl.querySelector(`li[data-node="${id}"]`);
+  selectedLi = null;
+  if (id === null) return;
+  revealNode(id);
+  selectedLi = liFor(id);
   if (selectedLi) {
     selectedLi.classList.add("selected");
     if (scrollTree) scrollTreePane(selectedLi);
   }
 }
 
-// 0-based byte offset of a 0-based char offset (inverse of byteToCharMap)
-function charToByte(off) {
-  const { b2c } = cached;
-  let lo = 0, hi = b2c.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    b2c[mid] < off ? (lo = mid + 1) : (hi = mid);
-  }
-  return lo;
-}
-
+// deepest non-trivia node containing the byte: ordered-tree descent
 function deepestNodeAt(byte) {
   let best = null;
-  cached.index.forEach((e, id) => {
-    if (e.trivia || byte < e.a || byte > e.b) return;
-    if (best === null || e.depth >= cached.index[best].depth) best = id;
-  });
+  let nodes = cached.roots;
+  for (;;) {
+    const k = lowerBound(nodes, byte, (n) => n.b);
+    if (k >= nodes.length || nodes[k].a > byte) break;
+    const n = nodes[k];
+    const e = cached.index[n._id];
+    if (!e.trivia) best = n._id;
+    if (n.leaf) break;
+    nodes = n.children;
+  }
   return best;
 }
 
@@ -467,10 +653,17 @@ function syncFromCursor() {
 }
 
 treeEl.addEventListener("click", (ev) => {
+  if (!cached) return;
   const li = ev.target.closest("li[data-node]");
-  if (!li || !cached) return;
+  if (!li) return;
   ev.stopPropagation();
-  const e = cached.index[+li.dataset.node];
+  const id = +li.dataset.node;
+  const e = cached.index[id];
+  // expander toggles; the rest of the line selects
+  if (ev.target.closest(".tw") && !e.leaf && e.node.children.length) {
+    expanded.has(id) ? collapseNode(e.node) : expandNode(e.node);
+    return;
+  }
   const { b2c } = cached;
   // highlight the node's FULL source range — including trivia that are
   // semantically inside it (the boxes trim trivia for visual tightness,
@@ -484,7 +677,8 @@ treeEl.addEventListener("click", (ev) => {
   syncing = false;
   // monaco's unfocused selection is nearly invisible: tint the range
   pickDecorations.set([{ range, options: { className: "tree-pick" } }]);
-  selectTreeNode(+li.dataset.node, { scrollTree: false });
+  selectTreeNode(id, { scrollTree: false });
+  scheduleHighlight();   // the reveal may have scrolled the viewport
 });
 
 // In tree mode, clicks select by the VISIBLE bounding boxes (paint order:
@@ -520,10 +714,12 @@ editor.onDidChangeCursorPosition(() => {
   syncFromCursor();
 });
 
+// --- parse + render --------------------------------------------------------------
+let lastParseMs = 0;
+
 function render() {
   const text = model.getValue();
   const bytes = new TextEncoder().encode(text);
-  const dec = new TextDecoder();
   const t0 = performance.now();
   let ev;
   try {
@@ -532,21 +728,30 @@ function render() {
     status.textContent = "parser trapped: " + e;
     return;
   }
-  const dt = (performance.now() - t0).toFixed(1);
+  const dt = performance.now() - t0;
+  lastParseMs = dt;
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
   const index = indexNodes(roots);
   cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index };
+  pickDecorations.clear();
   applyHighlight();
-  treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
+  renderTree();
   selectedLi = null;
   syncFromCursor();   // re-highlight the node under the (possibly new) cursor
   status.textContent =
-    `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt} ms (wasm)`;
+    `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt.toFixed(1)} ms (wasm)`;
 }
 
-editor.onDidChangeModelContent(render);
-// box geometry depends on layout (font load, container resize)
-editor.onDidLayoutChange(() => { mode === "tree" && applyHighlight(); });
+// debounce re-parsing when the last parse was slow (big files), so typing
+// stays responsive; small files keep the instant feedback
+let renderTimer = 0;
+editor.onDidChangeModelContent(() => {
+  clearTimeout(renderTimer);
+  renderTimer = setTimeout(render, lastParseMs > 150 ? 400 : 0);
+});
+// highlights cover the viewport (+buffer) only: refresh on scroll/layout
+editor.onDidScrollChange(scheduleHighlight);
+editor.onDidLayoutChange(scheduleHighlight);
 for (const r of document.querySelectorAll('input[name="hlmode"]')) {
   r.addEventListener("change", () => {
     mode = r.value;

@@ -6,36 +6,62 @@
 
 export const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 
-// Token/range indices are 1-based (token 1 is the parser's sentinel); byte
-// ranges are 1-based inclusive.
-export function buildTree(tokens, ranges, TOMBSTONE) {
-  const stack = [];
-  let i = 1, j = 0;
-  while (true) {
-    const lastToken = j < ranges.length ? ranges[j][2] : tokens.length;
-    while (i <= lastToken) {
-      const [head, , nextByte] = tokens[i - 1];
-      if ((head & 0xffff) === TOMBSTONE) { i++; continue; }
-      stack.push({ firstToken: i, node: {
-        head, a: tokens[i - 2][2], b: nextByte - 1, leaf: true } });
-      i++;
+// The parser's output is a post-order array of RawGreenNode events
+// [head, byteSpan, spanOrOrig]: flags bit 7 (in head >> 16) marks
+// non-terminals, whose subtree occupies the preceding `spanOrOrig` entries;
+// for terminals the third value is the original token kind.
+export const NON_TERMINAL_FLAG = 1 << 7;
+export const isNonTerminal = (head) =>
+  ((head >> 16) & NON_TERMINAL_FLAG) !== 0;
+
+// Reconstruct the green tree, mirroring JuliaSyntax's GreenTreeCursor:
+// walk the post-order array backwards; TOMBSTONE entries are skipped as
+// single entries contributing neither bytes nor children (their subtree
+// entries surface as siblings). Byte ranges are 1-based inclusive.
+export function buildTree(events, totalBytes, TOMBSTONE) {
+  function build(idx, endByte) {
+    const [head, byteSpan, spanOrOrig] = events[idx];
+    const a = endByte - byteSpan + 1, b = endByte;
+    if (!isNonTerminal(head)) return { head, a, b, leaf: true };
+    const children = [];
+    let i = idx - 1;
+    let e = endByte;
+    const stop = idx - spanOrOrig;
+    while (i >= stop) {
+      const [h, bs, so] = events[i];
+      if ((h & 0xffff) === TOMBSTONE) { i -= 1; continue; }
+      children.push(build(i, e));
+      e -= bs;
+      i -= 1 + (isNonTerminal(h) ? so : 0);
     }
-    if (j >= ranges.length) break;
-    while (j < ranges.length) {
-      const [head, firstToken, lt] = ranges[j];
-      if (lt !== lastToken) break;
-      if ((head & 0xffff) === TOMBSTONE) { j++; continue; }
-      let k = stack.length;
-      while (k > 0 && firstToken <= stack[k - 1].firstToken) k--;
-      const children = stack.slice(k).map((e) => e.node);
-      const node = { head,
-        a: tokens[firstToken - 2][2], b: tokens[lt - 1][2] - 1, children };
-      stack.length = k;
-      stack.push({ firstToken, node });
-      j++;
-    }
+    children.reverse();
+    return { head, a, b, leaf: false, children };
   }
-  return stack.map((e) => e.node);
+  const roots = [];
+  let i = events.length - 1;
+  let e = totalBytes;
+  while (i >= 0) {
+    const [h, bs, so] = events[i];
+    if ((h & 0xffff) === TOMBSTONE) { i -= 1; continue; }
+    roots.push(build(i, e));
+    e -= bs;
+    i -= 1 + (isNonTerminal(h) ? so : 0);
+  }
+  roots.reverse();
+  return roots;
+}
+
+// terminals in source order with absolute 1-based inclusive byte ranges
+// (post-order lists terminals in source order; non-terminals add no bytes)
+export function tokensFromEvents(events) {
+  const out = [];
+  let pos = 1;
+  for (const [head, byteSpan] of events) {
+    if (isNonTerminal(head)) continue;
+    out.push({ head, a: pos, b: pos + byteSpan - 1 });
+    pos += byteSpan;
+  }
+  return out;
 }
 
 const NCOLORS = 6;
@@ -53,18 +79,15 @@ const DELIMS = new Set(["(", ")", "[", "]", "{", "}", ",", ";",
                         "\"", "\"\"\"", "`", "```"]);
 export const isDelimName = (name) => DELIMS.has(name);
 
-// Mode 1: each non-whitespace token gets the next color in the palette
-// (token i spans bytes [tokens[i-1].next_byte, tokens[i].next_byte - 1])
-export function renderTokensHTML(tokens, bytes, dec, kindName, TOMBSTONE) {
+// Mode 1: each non-whitespace token gets the next color in the palette.
+// `tokens` is the output of tokensFromEvents.
+export function renderTokensHTML(tokens, bytes, dec, kindName) {
   let html = "";
   let ci = 0;
-  for (let i = 2; i <= tokens.length; i++) {
-    const [head, , nextByte] = tokens[i - 1];
-    const kind = head & 0xffff;
-    const name = kindName(kind);
-    const a = tokens[i - 2][2], b = nextByte - 1;
-    if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
-    const piece = dec.decode(bytes.subarray(a - 1, b));
+  for (const t of tokens) {
+    const name = kindName(t.head & 0xffff);
+    if (name === "TOMBSTONE" || name === "EndMarker" || t.b < t.a) continue;
+    const piece = dec.decode(bytes.subarray(t.a - 1, t.b));
     const isWs = name === "Whitespace" || name === "NewlineWs";
     let cls = "";
     if (isErrName(name)) {

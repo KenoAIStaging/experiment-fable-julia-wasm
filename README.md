@@ -9,10 +9,10 @@ only JS imports are the `emit_token` sink and `===` on Symbol constants.
 
 `parser.wasm` (parser.html) goes further: the complete `JuliaSyntax.jl`
 recursive-descent parser, including its error recovery and token validation,
-compiled the same way. The module streams the parser's native event
-representation (tokens + tree ranges) through `emit_token`/`emit_node`; the
-green parse tree is reconstructed host-side exactly like
-`JuliaSyntax.build_tree`. The editor is Monaco (loaded from the jsDelivr
+compiled the same way. The module streams the parser's native output —
+the post-order RawGreenNode array — through `emit_node`; the green parse
+tree is reconstructed host-side exactly like JuliaSyntax's GreenTreeCursor.
+A selector parses under any Julia syntax version (1.5 through 1.14). The editor is Monaco (loaded from the jsDelivr
 CDN); the wasm parser drives all highlighting — token colors as inline
 decorations, parse-tree boxes as an absolutely-positioned layer inside
 Monaco's scrolled content, measured via `getTopForLineNumber` /

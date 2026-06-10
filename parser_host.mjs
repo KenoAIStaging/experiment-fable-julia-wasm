@@ -57,7 +57,6 @@ function strtod(s) {
 }
 
 export async function instantiateParser(wasmBytes) {
-  let tokenSink = [];
   let nodeSink = [];
   let hbuf = [];
   let hbStatus = 0;
@@ -84,9 +83,7 @@ export async function instantiateParser(wasmBytes) {
   const imports = { julia: {} };
   for (const name of IMPORTS) {
     let fn;
-    if (name.includes("emit_token")) {
-      fn = (a, b, c) => { tokenSink.push([Number(a), Number(b), Number(c)]); };
-    } else if (name.includes("emit_node")) {
+    if (name.includes("emit_node")) {
       fn = (a, b, c) => { nodeSink.push([Number(a), Number(b), Number(c)]); };
     } else if (name.includes("egal")) {
       fn = (a, b) => (a === b ? 1 : 0);
@@ -140,16 +137,11 @@ export async function instantiateParser(wasmBytes) {
   const parse_into = exp.parse_into;
 
   return {
-    parse(text) {
-      tokenSink = [];
+    // vminor selects the Julia syntax version v1.<vminor>
+    parse(text, vminor = 14) {
       nodeSink = [];
-      const n = Number(parse_into(makeString(text)));
-      return {
-        ntokens: Math.floor(n / 1000000),
-        nnodes: n % 1000000,
-        tokens: tokenSink,
-        nodes: nodeSink,
-      };
+      const n = Number(parse_into(makeString(text), BigInt(vminor)));
+      return { count: n, events: nodeSink };
     },
   };
 }

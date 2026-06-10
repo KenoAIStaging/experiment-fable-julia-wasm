@@ -26,6 +26,11 @@
     padding: .1rem .55rem;
   }
   #modebar button:hover { background: #eef1f4; }
+  #modebar select {
+    font: inherit; font-size: .8rem; color: #1f2328;
+    background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
+    padding: .1rem .3rem;
+  }
   #panes { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
   #editor-wrap {
     flex: 1 1 34rem; min-width: 26rem;
@@ -112,6 +117,8 @@
   <label><input type="radio" name="hlmode" value="tokens">token colors</label>
   <label><input type="radio" name="hlmode" value="tree" checked>parse-tree boxes</label>
   <span class="sep"></span>
+  Julia syntax: <select id="jlver"></select>
+  <span class="sep"></span>
   Examples:
   <span id="examples"></span>
 </div>
@@ -122,8 +129,8 @@
 <script type="module">
 import { instantiateParser } from "./parser_host.mjs";
 import { KINDS } from "./parser_meta.js";
-import { esc, buildTree, byteToCharMap, isErrName, isExtentSkipName,
-         isDelimName } from "./tree_render.mjs";
+import { esc, buildTree, tokensFromEvents, byteToCharMap, isErrName,
+         isExtentSkipName, isDelimName } from "./tree_render.mjs";
 
 const treeEl = document.getElementById("tree");
 const status = document.getElementById("status");
@@ -211,7 +218,24 @@ try {
 let mode = localStorage.getItem("parser-demo-hlmode");
 if (mode !== "tokens" && mode !== "tree") mode = "tree";
 document.querySelector(`input[name="hlmode"][value="${mode}"]`).checked = true;
-let cached = null;   // { ev, text, bytes, b2c, roots, index }
+
+// Julia syntax version: every boundary where JuliaSyntax parses differently
+// (1.6/1.7/1.8/1.11/1.12/1.14); defaults to latest, remembered like the mode
+const VERSIONS = [
+  [5, "1.5"], [6, "1.6"], [7, "1.7"], [8, "1.8 – 1.10"],
+  [11, "1.11"], [12, "1.12 – 1.13"], [14, "1.14 (latest)"],
+];
+let jlver = parseInt(localStorage.getItem("parser-demo-jlver") ?? "", 10);
+if (!VERSIONS.some(([v]) => v === jlver)) jlver = 14;
+const verSel = document.getElementById("jlver");
+for (const [v, label] of VERSIONS) {
+  const o = document.createElement("option");
+  o.value = v;
+  o.textContent = label;
+  if (v === jlver) o.selected = true;
+  verSel.appendChild(o);
+}
+let cached = null;   // { events, tokens, text, bytes, b2c, roots, index }
 
 // first index with get(arr[i]) >= key (arrays sorted by get)
 const lowerBound = (arr, key, get) => {
@@ -293,27 +317,25 @@ function viewWindow() {
 
 // --- token mode: monaco inline decorations (viewport window only) --------------
 function tokenDecorations() {
-  const { ev, b2c } = cached;
+  const { tokens, b2c } = cached;
   const w = viewWindow();
   if (!w) return [];
-  const toks = ev.tokens;
   const out = [];
-  // first token (julia index i >= 2) whose end byte reaches the window
-  let i = 2 + lowerBound(toks.slice(1), w.vs + 1, (t) => t[2]);
-  for (; i <= toks.length; i++) {
-    const [head, , nextByte] = toks[i - 1];
-    const a = toks[i - 2][2], b = nextByte - 1;
-    if (a > w.ve) break;
-    const kind = head & 0xffff;
+  // first token whose end byte reaches the window
+  let i = lowerBound(tokens, w.vs, (t) => t.b);
+  for (; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.a > w.ve) break;
+    const kind = t.head & 0xffff;
     const name = kindName(kind);
-    if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
+    if (kind === TOMBSTONE || name === "EndMarker" || t.b < t.a) continue;
     const isWs = name === "Whitespace" || name === "NewlineWs";
     let cls = "";
     if (isErrName(name)) cls = "tok-error";
     else if (!isWs) cls = "c" + (i % 6);   // index-stable across scrolling
     if (!cls) continue;
-    const s = model.getPositionAt(b2c[a - 1]);
-    const e = model.getPositionAt(b2c[b]);
+    const s = model.getPositionAt(b2c[t.a - 1]);
+    const e = model.getPositionAt(b2c[t.b]);
     out.push({
       range: new monaco.Range(s.lineNumber, s.column, e.lineNumber, e.column),
       options: { inlineClassName: cls, hoverMessage: { value: name } },
@@ -898,17 +920,18 @@ function render() {
   const t0 = performance.now();
   let ev;
   try {
-    ev = parser.parse(text);
+    ev = parser.parse(text, jlver);
   } catch (e) {
     status.textContent = "parser trapped: " + e;
     return;
   }
   const dt = performance.now() - t0;
   lastParseMs = dt;
-  const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
+  const tokens = tokensFromEvents(ev.events);
+  const roots = buildTree(ev.events, bytes.length, TOMBSTONE);
   const b2c = byteToCharMap(text);
   const index = indexNodes(roots);
-  cached = { ev, text, bytes, b2c, roots, index,
+  cached = { events: ev.events, tokens, text, bytes, b2c, roots, index,
              version: model.getVersionId() };
   rebuildLineWidths();
   pickDecorations.clear();
@@ -917,7 +940,8 @@ function render() {
   selectedLi = null;
   syncFromCursor();   // re-highlight the node under the (possibly new) cursor
   status.textContent =
-    `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt.toFixed(1)} ms (wasm)`;
+    `${tokens.length} tokens, ${ev.events.length - tokens.length} tree nodes ` +
+    `in ${dt.toFixed(1)} ms (wasm, v1.${jlver} syntax)`;
 }
 
 // debounce re-parsing when the last parse was slow (big files), so typing
@@ -944,28 +968,55 @@ for (const r of document.querySelectorAll('input[name="hlmode"]')) {
     applyHighlight();
   });
 }
+verSel.addEventListener("change", () => {
+  jlver = parseInt(verSel.value, 10);
+  localStorage.setItem("parser-demo-jlver", String(jlver));
+  render();   // full reparse under the selected syntax version
+});
 
-// --- larger example sources, fetched straight from GitHub ----------------------
+// --- example sources: built-in snippets + files straight from GitHub -----------
+const SAMPLE114 = `# Julia 1.14 syntax — flip the version selector left of the examples
+# to see older versions flag these forms as errors
+
+typegroup struct Tree
+    children::Vector{Forest}
+end
+struct Forest
+    trees::Vector{Tree}
+end
+end
+
+function findpair(xs)
+    @label outer for x in xs
+        for y in xs
+            x + y == 10 && break outer (x, y)
+            y < 0 && continue outer
+        end
+    end
+end`;
 const JL = "https://raw.githubusercontent.com/JuliaLang/julia/v1.12.1";
 const EXAMPLES = [
-  ["mandel", null],
-  ["sort.jl", `${JL}/base/sort.jl`],
-  ["show.jl", `${JL}/base/show.jl`],
-  ["abstractinterpretation.jl", `${JL}/Compiler/src/abstractinterpretation.jl`],
+  ["mandel", { text: SAMPLE, title: "the built-in sample" }],
+  ["1.14 syntax", { text: SAMPLE114,
+    title: "typegroup + labeled break/continue (new in Julia 1.14)" }],
+  ["sort.jl", { url: `${JL}/base/sort.jl` }],
+  ["show.jl", { url: `${JL}/base/show.jl` }],
+  ["abstractinterpretation.jl",
+   { url: `${JL}/Compiler/src/abstractinterpretation.jl` }],
 ];
 const exSpan = document.getElementById("examples");
-for (const [label, url] of EXAMPLES) {
+for (const [label, ex] of EXAMPLES) {
   const b = document.createElement("button");
   b.textContent = label;
-  b.title = url ? `julia ${url.slice(JL.length - 7)}` : "the built-in sample";
+  b.title = ex.title ?? `julia ${ex.url.slice(JL.length - 7)}`;
   b.addEventListener("click", async () => {
-    if (!url) {
-      editor.setValue(SAMPLE);
+    if (ex.text !== undefined) {
+      editor.setValue(ex.text);
       return;
     }
     status.textContent = `fetching ${label}…`;
     try {
-      const r = await fetch(url);
+      const r = await fetch(ex.url);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       editor.setValue(await r.text());
     } catch (err) {

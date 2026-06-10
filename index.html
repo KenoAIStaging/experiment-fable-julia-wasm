@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Julia lexer — compiled to WebAssembly</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 2rem; background: #fafafa; color: #1f2328;
+    font-family: system-ui, sans-serif;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 .wasm { color: #654ff0; }
+  p.sub { color: #57606a; font-size: .85rem; max-width: 60rem; }
+  #status { font-size: .8rem; color: #57606a; margin-bottom: .75rem; }
+  #editor-wrap {
+    position: relative; max-width: 60rem;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
+  }
+  #highlight, #input {
+    box-sizing: border-box; width: 100%; min-height: 22rem; margin: 0;
+    padding: 1rem; border: 0;
+    font: 14px/1.6 ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
+    tab-size: 4;
+  }
+  #highlight {
+    position: absolute; inset: 0; pointer-events: none; color: #1f2328;
+    overflow: hidden;
+  }
+  #input {
+    position: relative; background: transparent; color: transparent;
+    caret-color: #1f2328; resize: vertical; outline: none; display: block;
+  }
+  /* one light color per token, cycling */
+  .c0 { background: #ffd6d6; }   /* red    */
+  .c1 { background: #ffe7b8; }   /* orange */
+  .c2 { background: #fdf3a9; }   /* yellow */
+  .c3 { background: #c9f2c5; }   /* green  */
+  .c4 { background: #c5e8f7; }   /* blue   */
+  .c5 { background: #e4d5f7; }   /* purple */
+  span[data-tok] { border-radius: 3px; }
+  .tok-error { background: #d73a49; color: #ffffff; }
+  #tokens {
+    max-width: 60rem; margin-top: 1rem; font: 12px ui-monospace, monospace;
+    color: #57606a; white-space: pre-wrap; line-height: 1.8;
+  }
+  #tokens span { border-radius: 3px; padding: 1px 3px; margin-right: 4px; }
+</style>
+</head>
+<body>
+<h1>JuliaSyntax lexer, compiled Julia&nbsp;IR&nbsp;→&nbsp;<span class="wasm">WebAssembly</span></h1>
+<p class="sub">
+  The actual <code>JuliaSyntax.Tokenize</code> lexer — compiled from Julia's
+  optimized IR to WasmGC (no manual port; unicode tables run in-wasm via
+  UnicodeNext). Type Julia code below; each token gets the next color in a
+  light palette, so every boundary is visible. Hover a token for its kind.
+</p>
+<div id="status">loading lexer.wasm…</div>
+<div id="editor-wrap">
+  <pre id="highlight" aria-hidden="true"></pre>
+  <textarea id="input" spellcheck="false">function mandel(z::Complex)
+    c = z
+    for n in 1:80
+        abs2(z) ≥ 4.0 && return n - 1
+        z = z^2 + c   # escape-time iteration
+    end
+    return 80
+end
+
+s = "interpolate: $(mandel(0.3 + 0.5im))"
+@show s</textarea>
+</div>
+<div id="tokens"></div>
+<script type="module">
+import { instantiateLexer } from "./lexer_host.mjs";
+import { KINDS } from "./lexer_meta.js";
+
+const NCOLORS = 6;
+const input = document.getElementById("input");
+const highlight = document.getElementById("highlight");
+const tokensEl = document.getElementById("tokens");
+const status = document.getElementById("status");
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+let lexer = null;
+try {
+  const bytes = await (await fetch("./lexer.wasm")).arrayBuffer();
+  lexer = await instantiateLexer(bytes);
+  status.textContent = "lexer.wasm instantiated — lexing locally in your browser";
+} catch (e) {
+  status.textContent = "failed to load lexer.wasm: " + e + " (browser needs WasmGC: Chrome 119+/Firefox 120+/Safari 18.4+)";
+  throw e;
+}
+
+function render() {
+  const text = input.value;
+  const bytes = new TextEncoder().encode(text);
+  const dec = new TextDecoder();
+  const t0 = performance.now();
+  let tokens;
+  try {
+    tokens = lexer.lex(text).tokens;
+  } catch (e) {
+    status.textContent = "lexer trapped: " + e;
+    return;
+  }
+  const dt = (performance.now() - t0).toFixed(1);
+
+  let html = "";
+  let list = "";
+  let ci = 0;
+  for (const [kind, a, b] of tokens) {
+    const name = (KINDS[kind] ?? [String(kind)])[0];
+    if (name === "EndMarker" || b < a) continue;
+    const piece = dec.decode(bytes.subarray(a, b + 1)); // 0-based start, inclusive end
+    const isWs = name === "Whitespace" || name === "NewlineWs";
+    const isErr = name.startsWith("Error") || name === "error";
+    let cls = "";
+    if (isErr) {
+      cls = "tok-error";
+    } else if (!isWs) {
+      cls = "c" + (ci % NCOLORS);
+      ci++;
+    }
+    html += cls
+      ? `<span class="${cls}" data-tok="${name}" title="${name}">${esc(piece)}</span>`
+      : esc(piece);
+    if (!isWs) {
+      list += `<span class="${cls}">${esc(JSON.stringify(piece))} ${name}</span>`;
+    }
+  }
+  highlight.innerHTML = html + "\n";
+  status.textContent = `${tokens.length} tokens in ${dt} ms (wasm)`;
+  tokensEl.innerHTML = list;
+}
+
+input.addEventListener("input", render);
+input.addEventListener("scroll", () => {
+  highlight.scrollTop = input.scrollTop;
+});
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Julia parser — compiled to WebAssembly</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 2rem; background: #fafafa; color: #1f2328;
+    font-family: system-ui, sans-serif;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 .wasm { color: #654ff0; }
+  p.sub { color: #57606a; font-size: .85rem; max-width: 72rem; }
+  #status { font-size: .8rem; color: #57606a; }
+  #modebar {
+    font-size: .85rem; color: #1f2328; margin: .4rem 0 .75rem;
+    display: flex; gap: 1rem; align-items: center;
+  }
+  #modebar label { cursor: pointer; user-select: none; }
+  #modebar input { accent-color: #654ff0; margin-right: .3rem; }
+  #panes { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+  #editor-wrap {
+    flex: 1 1 34rem; min-width: 26rem;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
+    overflow: hidden;
+  }
+  #editor { height: 30rem; }
+  /* token mode: one light color per token, cycling (monaco inline decorations) */
+  .monaco-editor .c0 { background: #ffd6d6; border-radius: 3px; }
+  .monaco-editor .c1 { background: #ffe7b8; border-radius: 3px; }
+  .monaco-editor .c2 { background: #fdf3a9; border-radius: 3px; }
+  .monaco-editor .c3 { background: #c9f2c5; border-radius: 3px; }
+  .monaco-editor .c4 { background: #c5e8f7; border-radius: 3px; }
+  .monaco-editor .c5 { background: #e4d5f7; border-radius: 3px; }
+  .monaco-editor .tok-error { background: #d73a49; color: #ffffff !important; }
+  /* range tint when a tree-outline node is clicked */
+  .monaco-editor .tree-pick { background: rgba(255, 211, 61, .45); border-radius: 3px; }
+  /* tree mode: 2D bounding boxes drawn into monaco's scrolled content */
+  #treeboxes { position: absolute; top: 0; left: 0; pointer-events: none; }
+  .bb {
+    position: absolute; box-sizing: border-box; border-radius: 4px;
+    border: 1.5px solid; pointer-events: none;
+  }
+  .b0 { border-color: #d64545; background: rgba(214,69,69,.045); }
+  .b1 { border-color: #d88a1e; background: rgba(216,138,30,.045); }
+  .b2 { border-color: #b09a12; background: rgba(196,176,21,.055); }
+  .b3 { border-color: #3f9b3c; background: rgba(63,155,60,.045); }
+  .b4 { border-color: #2f7fc1; background: rgba(47,127,193,.045); }
+  .b5 { border-color: #8a5bc7; background: rgba(138,91,199,.045); }
+  .bb-err { border: 2px solid #d73a49; background: rgba(215,58,73,.10); }
+  /* leaf tokens: light neutral boxes so the colored structure dominates */
+  .bb-leaf {
+    border: 1px solid rgba(31,35,40,.28); background: rgba(31,35,40,.025);
+    border-radius: 3px;
+  }
+  #tree-wrap {
+    flex: 1 1 26rem; min-width: 22rem; max-height: 40rem; overflow: auto;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
+    padding: .75rem 1rem; font: 13px/1.55 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #tree-wrap ul { list-style: none; margin: 0; padding-left: 1.1rem;
+                  border-left: 1px dotted #d0d7de; }
+  #tree-wrap > ul { padding-left: 0; border-left: 0; }
+  #tree-wrap li { margin: 1px 0; }
+  #tree-wrap li[data-node] > .nodeline { cursor: pointer; }
+  .nodeline { border-radius: 3px; padding: 0 2px; }
+  li.selected > .nodeline { background: #fff8c5; box-shadow: 0 0 0 1px #d4a72c; }
+  .nodekind { font-weight: 600; }
+  /* interior labels carry their box's depth color */
+  .nodekind.d0 { color: #d64545; } .nodekind.d1 { color: #d88a1e; }
+  .nodekind.d2 { color: #b09a12; } .nodekind.d3 { color: #3f9b3c; }
+  .nodekind.d4 { color: #2f7fc1; } .nodekind.d5 { color: #8a5bc7; }
+  .nodekind.err { color: #ffffff; background: #d73a49; border-radius: 3px;
+                  padding: 0 3px; }
+  /* leaves mirror the editor's gray chips */
+  .leafkind {
+    color: #1f2328; background: rgba(31,35,40,.05);
+    border: 1px solid rgba(31,35,40,.25); border-radius: 3px; padding: 0 3px;
+  }
+  .trivia { color: #b1b7be; }
+  .trivia .leafkind { color: #b1b7be; background: none; border: none; padding: 0; }
+  .range { color: #97a0a9; font-size: 11px; }
+  .snippet { color: #1a7f37; }
+  .snippet.trv { color: #b1b7be; }
+</style>
+</head>
+<body>
+<h1>JuliaSyntax parser, compiled Julia&nbsp;IR&nbsp;→&nbsp;<span class="wasm">WebAssembly</span></h1>
+<p class="sub">
+  The complete <code>JuliaSyntax.jl</code> recursive-descent parser — compiled
+  from Julia's optimized IR to WasmGC, no manual port. The wasm module streams
+  the parser's native output events (tokens + tree ranges); the green parse
+  tree on the right is reconstructed from them exactly like
+  <code>JuliaSyntax.build_tree</code> does. Try breaking the code — the
+  parser's error recovery runs in wasm too.
+  (See also the <a href="./index.html">lexer-only demo</a>.)
+</p>
+<div id="status">loading parser.wasm…</div>
+<div id="modebar">
+  Highlight:
+  <label><input type="radio" name="hlmode" value="tokens">token colors</label>
+  <label><input type="radio" name="hlmode" value="tree" checked>parse-tree boxes</label>
+</div>
+<div id="panes">
+  <div id="editor-wrap"><div id="editor"></div></div>
+  <div id="tree-wrap"><ul id="tree"></ul></div>
+</div>
+<script type="module">
+import { instantiateParser } from "./parser_host.mjs";
+import { KINDS } from "./parser_meta.js";
+import { esc, buildTree, byteToCharMap, isErrName, isExtentSkipName,
+         isDelimName } from "./tree_render.mjs";
+
+const treeEl = document.getElementById("tree");
+const status = document.getElementById("status");
+
+const kindName = (id) => (KINDS[id] ?? [String(id)])[0];
+let TOMBSTONE = -1;
+for (const [id, [nm]] of Object.entries(KINDS))
+  if (nm === "TOMBSTONE") TOMBSTONE = Number(id);
+
+const SAMPLE = `function mandel(z::Complex)
+    c = z
+    for n in 1:80
+        abs2(z) ≥ 4.0 && return n - 1
+        z = z^2 + c   # escape-time iteration
+    end
+    return 80
+end
+
+s = "interpolate: \$(mandel(0.3 + 0.5im))"
+@show s`;
+
+// --- monaco (CDN AMD loader) -------------------------------------------------
+const MONACO = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs";
+self.MonacoEnvironment = {
+  getWorkerUrl: () => URL.createObjectURL(new Blob(
+    [`self.MonacoEnvironment={baseUrl:'${MONACO}/'};importScripts('${MONACO}/base/worker/workerMain.js');`],
+    { type: "text/javascript" })),
+};
+await new Promise((res, rej) => {
+  const s = document.createElement("script");
+  s.src = MONACO + "/loader.js";
+  s.onload = res;
+  s.onerror = rej;
+  document.head.append(s);
+});
+require.config({ paths: { vs: MONACO } });
+await new Promise((res) => require(["vs/editor/editor.main"], res));
+
+const editor = monaco.editor.create(document.getElementById("editor"), {
+  value: SAMPLE,
+  language: "plaintext",        // our wasm parser does the highlighting
+  theme: "vs",
+  fontFamily: 'ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace',
+  fontSize: 14,
+  lineHeight: 24,
+  minimap: { enabled: false },
+  wordWrap: "off",
+  scrollBeyondLastLine: false,
+  renderLineHighlight: "none",
+  guides: { indentation: false },
+  folding: false,
+  occurrencesHighlight: "off",
+  selectionHighlight: false,
+  matchBrackets: "never",
+  unicodeHighlight: { ambiguousCharacters: false },
+  renderWhitespace: "none",
+  // no intellisense: the only assistance here is the wasm parser's output
+  quickSuggestions: false,
+  suggestOnTriggerCharacters: false,
+  wordBasedSuggestions: "off",
+  parameterHints: { enabled: false },
+  tabCompletion: "off",
+  snippetSuggestions: "none",
+  acceptSuggestionOnEnter: "off",
+  padding: { top: 10, bottom: 10 },
+  automaticLayout: true,
+});
+const model = editor.getModel();
+const decorations = editor.createDecorationsCollection([]);
+// swallow the explicit trigger-suggest keybinding as well
+editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {});
+
+let parser = null;
+try {
+  const bytes = await (await fetch("./parser.wasm")).arrayBuffer();
+  parser = await instantiateParser(bytes);
+  status.textContent = "parser.wasm instantiated — parsing locally in your browser";
+} catch (e) {
+  status.textContent = "failed to load parser.wasm: " + e + " (browser needs WasmGC: Chrome 119+/Firefox 120+/Safari 18.4+)";
+  throw e;
+}
+
+// preorder index of all nodes: assigns ids (mirrored as data-node in the
+// tree pane), depths, and trimmed extents for editor selections
+function indexNodes(roots) {
+  const list = [];
+  function rec(node, depth) {
+    const name = kindName(node.head & 0xffff);
+    const err = isErrName(name);
+    const trivia = node.leaf && isExtentSkipName(name) && !err;
+    const entry = { a: node.a, b: node.b, lo: node.a, hi: node.b,
+                    depth, err, trivia, leaf: !!node.leaf };
+    node._id = list.length;
+    node._depth = depth;
+    list.push(entry);
+    if (node.leaf) return trivia ? null : [node.a, node.b];
+    let lo = 0, hi = 0;
+    for (const c of node.children) {
+      const r = rec(c, depth + 1);
+      if (r !== null) {
+        if (lo === 0) lo = r[0];
+        hi = r[1];
+      }
+    }
+    if (lo !== 0) {
+      entry.lo = lo;
+      entry.hi = hi;
+    }
+    return [entry.lo, entry.hi];
+  }
+  for (const r of roots) rec(r, 0);
+  return list;
+}
+
+function renderNode(node, bytes, dec) {
+  const kind = node.head & 0xffff;
+  const name = kindName(kind);
+  const isErr = isErrName(name);
+  const isTrivia = name === "Whitespace" || name === "NewlineWs" || name === "Comment";
+  const range = `<span class="range">[${node.a}:${node.b}]</span>`;
+  if (node.leaf) {
+    const piece = dec.decode(bytes.subarray(node.a - 1, node.b));
+    const shown = piece.length > 24 ? piece.slice(0, 24) + "…" : piece;
+    const kcls = isErr ? "nodekind err" : "leafkind";
+    return `<li class="${isTrivia ? "trivia" : ""}" data-node="${node._id}">` +
+           `<span class="nodeline"><span class="${kcls}">${esc(name)}</span> ` +
+           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}</span></li>`;
+  }
+  const inner = node.children.map((c) => renderNode(c, bytes, dec)).join("");
+  const kcls = isErr ? "nodekind err" : `nodekind d${node._depth % 6}`;
+  return `<li data-node="${node._id}"><span class="nodeline">` +
+         `<span class="${kcls}">[${esc(name)}]</span> ${range}</span>` +
+         `<ul>${inner}</ul></li>`;
+}
+
+// highlight mode: default to the parse-tree boxes, remember the choice
+let mode = localStorage.getItem("parser-demo-hlmode");
+if (mode !== "tokens" && mode !== "tree") mode = "tree";
+document.querySelector(`input[name="hlmode"][value="${mode}"]`).checked = true;
+let cached = null;   // { ev, text, bytes, b2c, roots, index }
+
+// --- token mode: monaco inline decorations -----------------------------------
+function tokenDecorations() {
+  const { ev, b2c } = cached;
+  const out = [];
+  let ci = 0;
+  for (let i = 2; i <= ev.tokens.length; i++) {
+    const [head, , nextByte] = ev.tokens[i - 1];
+    const kind = head & 0xffff;
+    const name = kindName(kind);
+    const a = ev.tokens[i - 2][2], b = nextByte - 1;
+    if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
+    const isWs = name === "Whitespace" || name === "NewlineWs";
+    let cls = "";
+    if (isErrName(name)) cls = "tok-error";
+    else if (!isWs) cls = "c" + (ci++ % 6);
+    if (!cls) continue;
+    const s = model.getPositionAt(b2c[a - 1]);
+    const e = model.getPositionAt(b2c[b]);
+    out.push({
+      range: new monaco.Range(s.lineNumber, s.column, e.lineNumber, e.column),
+      options: { inlineClassName: cls, hoverMessage: { value: name } },
+    });
+  }
+  return out;
+}
+
+// --- tree mode: 2D boxes in monaco's scrolled content -------------------------
+function boxLayer() {
+  const host = editor.getDomNode().querySelector(".lines-content");
+  let layer = host.querySelector("#treeboxes");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.id = "treeboxes";
+    host.appendChild(layer);
+  }
+  return layer;
+}
+
+// content-space rect of a byte range (1-based inclusive); multi-line ranges
+// union their per-line extents (tokens only — boxes union these further).
+// Vertically inset from the full line box toward the glyph ink, so boxes on
+// consecutive lines don't touch (outsets re-expand them by nesting depth).
+function measureRange(a, b) {
+  const { b2c } = cached;
+  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
+  const fontSize = editor.getOption(monaco.editor.EditorOption.fontSize);
+  const vinset = Math.max(Math.floor((lineH - fontSize) / 2) - 1, 0);
+  const s = model.getPositionAt(b2c[a - 1]);
+  const e = model.getPositionAt(Math.max(b2c[b], b2c[a - 1]));
+  let left = Infinity, right = -Infinity;
+  for (let ln = s.lineNumber; ln <= e.lineNumber; ln++) {
+    const c1 = ln === s.lineNumber ? s.column : 1;
+    const c2 = ln === e.lineNumber ? e.column : model.getLineMaxColumn(ln);
+    left = Math.min(left, editor.getOffsetForColumn(ln, c1));
+    right = Math.max(right, editor.getOffsetForColumn(ln, c2));
+  }
+  return { left, right,
+           top: editor.getTopForLineNumber(s.lineNumber) + vinset,
+           bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
+}
+
+let drawnBoxes = null;   // visible box rects in paint order, for click hit-tests
+
+function renderBoxes() {
+  const { text, b2c, roots } = cached;
+  const layer = boxLayer();
+  layer.replaceChildren();
+  drawnBoxes = [];
+  const union = (u, v) =>
+    v === null ? u : u === null ? { ...v } : {
+      left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
+      right: Math.max(u.right, v.right), bottom: Math.max(u.bottom, v.bottom),
+    };
+  const entries = [];
+  function rec(node, depth) {       // -> {h, u, lo, hi}
+    const name = kindName(node.head & 0xffff);
+    const err = isErrName(name);
+    if (node.leaf) {
+      if (isExtentSkipName(name) && !err) return { h: 0, u: null, lo: 0, hi: 0 };
+      const u = measureRange(node.a, node.b);
+      if (err) {
+        entries.push({ u: { ...u }, depth, height: 0, err, name,
+                       lo: node.a, hi: node.b, id: node._id });
+      } else if (!isDelimName(name) && name !== "Comment") {
+        entries.push({ u: { ...u }, depth, height: 0, err: false, leaf: true,
+                       name, lo: node.a, hi: node.b, id: node._id });
+      }
+      return { h: 0, u, lo: node.a, hi: node.b };
+    }
+    const entry = { u: null, depth, height: 0, err, name: `[${name}]`,
+                    lo: node.a, hi: node.b, id: node._id };
+    entries.push(entry);
+    let h = 0;
+    let u = null;
+    let lo = 0, hi = 0;
+    for (const c of node.children) {
+      const r = rec(c, depth + 1);
+      h = Math.max(h, r.h + 1);
+      if (r.u !== null) {
+        u = union(u, r.u);
+        if (lo === 0) lo = r.lo;
+        hi = r.hi;
+      }
+    }
+    entry.height = h;
+    if (u === null) {
+      // all-trivia node (e.g. an empty block): fall back to its full range
+      u = node.b >= node.a ? measureRange(node.a, node.b) : null;
+      lo = node.a;
+      hi = node.b;
+    }
+    entry.u = u;
+    entry.lo = lo;
+    entry.hi = hi;
+    return { h, u, lo, hi };
+  }
+  for (const r of roots) rec(r, 0);
+  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
+  const spacey = (c) =>
+    c === undefined || c === " " || c === "\n" || c === "\t";
+  for (const e of entries) {
+    if (e.u === null) continue;
+    const pad = Math.min(e.height, 3) + 1;
+    // horizontal outset only into whitespace: a single-line box knows
+    // exactly which characters flank it — when the neighbor is a glyph
+    // (e.g. the $ before an interpolation's parens, or adjacent tokens in
+    // z^2), the edge stays flush so neighboring boxes share one seam
+    const oneLine = e.u.bottom - e.u.top < 1.5 * lineH;
+    let padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
+    const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 0;
+    // content space is clipped at x=0 (the line-number margin starts there):
+    // column-1 boxes can only outset into what's actually available
+    padL = Math.min(padL, Math.max(e.u.left, 0));
+    const d = document.createElement("div");
+    d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
+    d.title = e.name;
+    const left = e.u.left - padL;
+    const top = e.u.top - pad;
+    const width = Math.max(e.u.right - e.u.left, 3) + padL + padR;
+    const height = e.u.bottom - e.u.top + 2 * pad;
+    d.style.left = left + "px";
+    d.style.top = top + "px";
+    d.style.width = width + "px";
+    d.style.height = height + "px";
+    layer.appendChild(d);
+    drawnBoxes.push({ left, top, right: left + width, bottom: top + height,
+                      id: e.id });
+  }
+}
+
+function applyHighlight() {
+  if (!cached) return;
+  if (mode === "tokens") {
+    boxLayer().replaceChildren();
+    decorations.set(tokenDecorations());
+  } else {
+    decorations.set([]);
+    renderBoxes();
+  }
+}
+
+// --- editor <-> tree-outline sync ---------------------------------------------
+let selectedLi = null;
+let syncing = false;
+const pickDecorations = editor.createDecorationsCollection([]);
+
+// scroll ONLY the tree pane (scrollIntoView could also scroll the page,
+// which is jarring when zoomed in)
+function scrollTreePane(li) {
+  const wrap = document.getElementById("tree-wrap");
+  const line = li.querySelector(":scope > .nodeline") ?? li;
+  const lr = line.getBoundingClientRect();
+  const wr = wrap.getBoundingClientRect();
+  if (lr.top < wr.top || lr.bottom > wr.bottom) {
+    wrap.scrollTop += lr.top - (wr.top + wr.height / 3);
+  }
+}
+
+function selectTreeNode(id, { scrollTree }) {
+  selectedLi?.classList.remove("selected");
+  selectedLi = id === null ? null : treeEl.querySelector(`li[data-node="${id}"]`);
+  if (selectedLi) {
+    selectedLi.classList.add("selected");
+    if (scrollTree) scrollTreePane(selectedLi);
+  }
+}
+
+// 0-based byte offset of a 0-based char offset (inverse of byteToCharMap)
+function charToByte(off) {
+  const { b2c } = cached;
+  let lo = 0, hi = b2c.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    b2c[mid] < off ? (lo = mid + 1) : (hi = mid);
+  }
+  return lo;
+}
+
+function deepestNodeAt(byte) {
+  let best = null;
+  cached.index.forEach((e, id) => {
+    if (e.trivia || byte < e.a || byte > e.b) return;
+    if (best === null || e.depth >= cached.index[best].depth) best = id;
+  });
+  return best;
+}
+
+function syncFromCursor() {
+  if (!cached) return;
+  const pos = editor.getPosition();
+  const byte = charToByte(model.getOffsetAt(pos)) + 1;
+  selectTreeNode(deepestNodeAt(byte), { scrollTree: true });
+}
+
+treeEl.addEventListener("click", (ev) => {
+  const li = ev.target.closest("li[data-node]");
+  if (!li || !cached) return;
+  ev.stopPropagation();
+  const e = cached.index[+li.dataset.node];
+  const { b2c } = cached;
+  // highlight the node's FULL source range — including trivia that are
+  // semantically inside it (the boxes trim trivia for visual tightness,
+  // but the node owns those bytes)
+  const s = model.getPositionAt(b2c[e.a - 1]);
+  const en = model.getPositionAt(Math.max(b2c[e.b], b2c[e.a - 1]));
+  const range = new monaco.Range(s.lineNumber, s.column, en.lineNumber, en.column);
+  syncing = true;
+  editor.setSelection(range);
+  editor.revealRangeInCenterIfOutsideViewport(range);   // editor-internal scroll
+  syncing = false;
+  // monaco's unfocused selection is nearly invisible: tint the range
+  pickDecorations.set([{ range, options: { className: "tree-pick" } }]);
+  selectTreeNode(+li.dataset.node, { scrollTree: false });
+});
+
+// In tree mode, clicks select by the VISIBLE bounding boxes (paint order:
+// last containing box wins = the innermost one). Monaco clamps clicks past
+// the end of a line to the line's last column, so the cursor position would
+// pick the wrong node for clicks inside a box but beyond the text.
+let suppressCursorSync = false;
+editor.onMouseDown((e) => {
+  if (mode !== "tree" || !cached || !drawnBoxes) return;
+  const be = e.event.browserEvent;
+  const rect = editor.getDomNode().getBoundingClientRect();
+  const layout = editor.getLayoutInfo();
+  const x = be.clientX - rect.left - layout.contentLeft + editor.getScrollLeft();
+  const y = be.clientY - rect.top + editor.getScrollTop();
+  let hit = null;
+  for (const b of drawnBoxes) {
+    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) hit = b;
+  }
+  if (hit !== null) {
+    suppressCursorSync = true;   // the click's cursor event must not override
+    pickDecorations.clear();
+    selectTreeNode(hit.id, { scrollTree: true });
+  }
+});
+
+editor.onDidChangeCursorPosition(() => {
+  if (syncing) return;
+  pickDecorations.clear();
+  if (suppressCursorSync) {
+    suppressCursorSync = false;
+    return;
+  }
+  syncFromCursor();
+});
+
+function render() {
+  const text = model.getValue();
+  const bytes = new TextEncoder().encode(text);
+  const dec = new TextDecoder();
+  const t0 = performance.now();
+  let ev;
+  try {
+    ev = parser.parse(text);
+  } catch (e) {
+    status.textContent = "parser trapped: " + e;
+    return;
+  }
+  const dt = (performance.now() - t0).toFixed(1);
+  const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
+  const index = indexNodes(roots);
+  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index };
+  applyHighlight();
+  treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
+  selectedLi = null;
+  syncFromCursor();   // re-highlight the node under the (possibly new) cursor
+  status.textContent =
+    `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt} ms (wasm)`;
+}
+
+editor.onDidChangeModelContent(render);
+// box geometry depends on layout (font load, container resize)
+editor.onDidLayoutChange(() => { mode === "tree" && applyHighlight(); });
+for (const r of document.querySelectorAll('input[name="hlmode"]')) {
+  r.addEventListener("change", () => {
+    mode = r.value;
+    localStorage.setItem("parser-demo-hlmode", mode);
+    applyHighlight();
+  });
+}
+render();
+</script>
+</body>
+</html>

@@ -172,6 +172,7 @@ const editor = monaco.editor.create(document.getElementById("editor"), {
   matchBrackets: "never",
   unicodeHighlight: { ambiguousCharacters: false },
   renderWhitespace: "none",
+  stickyScroll: { enabled: false },   // pinned scope lines confuse the boxes
   // no intellisense: the only assistance here is the wasm parser's output
   quickSuggestions: false,
   suggestOnTriggerCharacters: false,
